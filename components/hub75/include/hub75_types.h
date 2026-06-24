@@ -81,7 +81,12 @@ enum class Hub75ShiftDriver {
   ICN2038S,  // Alias for FM6126A
   FM6124,    // FM6124 family
   MBI5124,   // MBI5124 (requires positive clock edge)
-  DP3246     // DP3246 (special timing requirements)
+  DP3246,    // DP3246 (special timing requirements)
+  FM6353,    // FM6353 S-PWM driver
+  FM6363,    // FM6363 S-PWM driver
+  FM6363C = FM6363,  // FM6363C S-PWM driver alias
+  FM6565S,           // FM6565S/FM6565QB S-PWM driver
+  FM6565C = FM6565S  // FM6565C S-PWM driver alias
 };
 
 /**

@@ -280,6 +280,17 @@ HUB75_LAYOUT_ROWS = 1
 HUB75_LAYOUT_COLS = 1
 ```
 
+### S-PWM Panels: FM6363C / FM6565C
+
+FM6353/FM6363C/FM6565C panels are not ordinary shift-register HUB75 panels.
+They use S-PWM grayscale data and GCLK packet timing. `HUB75_DRIVER_FM6363`
+enables the experimental FM6363C register initialization, while
+`HUB75_DRIVER_FM6565C` currently runs a diagnostic solid-frame GCLK path using
+an FM6363-compatible register set. Its diagnostic loader writes 16-bit grayscale
+words with `DATA_LATCH`, sends `VSYNC`, then scans rows with 74 OE/GCLK pulses
+per line. Treat FM6565C as a hardware bring-up mode until the full register
+protocol is verified on the target panel.
+
 ### Two Panels Horizontal (128×64)
 ```
 HUB75_PANEL_WIDTH = 64

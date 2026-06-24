@@ -36,6 +36,11 @@ Menuconfig: HUB75 Display Configuration → Panel Settings → Shift Driver → 
 
 Many modern panels (2018+) use FM6126A or ICN2038S chips requiring initialization sequence.
 
+FM6363C/FM6565C panels are S-PWM/GCLK panels. They need grayscale data loading
+and GCLK packet timing, so selecting FM6126A is not expected to make those
+panels work. Use the experimental FM6363/FM6565C options only for bring-up and
+expect panel-specific timing/register verification.
+
 **3. Wrong pin configuration**
 - Verify board preset matches your hardware
 - Check `printPinConfig()` output in serial monitor

@@ -14,6 +14,7 @@ High-performance DMA-based driver for HUB75 RGB LED matrix panels, supporting ES
 - ✅ **BCM timing** - Descriptor duplication (GDMA/I2S) or buffer padding (PARLIO)
 - ✅ **Scan pattern support** - 1/4, 1/8, 1/16, 1/32 scan panels with coordinate remapping
 - ✅ **Shift driver initialization** - FM6126A/ICN2038S, FM6124, MBI5124, DP3246
+- ⚠️ **Experimental S-PWM support** - FM6353/FM6363C init and FM6565C diagnostic GCLK path
 - ✅ **Multi-panel layouts** - Serpentine and zigzag chaining for M×N grids
   - Serpentine: Alternate rows upside down (saves cable length)
   - Zigzag: All panels upright (longer cables)

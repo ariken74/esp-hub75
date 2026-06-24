@@ -83,6 +83,14 @@ class ParlioDma : public PlatformDma {
   void configure_gpio();
   bool allocate_row_buffers();
   void initialize_blank_buffers();
+
+  // ICN2053/FM6565 mode (PWM/internal-SRAM driver family) — separate buffer builder
+  // that reuses the PARLIO TX unit, clock gating, and chunk-streaming engine.
+  bool allocate_icn2053_buffers();
+  void build_icn2053_frame(BitPlaneBuffer *buffers, bool full_white);
+  uint16_t scale_icn2053_color(uint8_t value) const;
+  void write_icn2053_pixel(uint16_t phys_x, uint16_t phys_row, bool is_lower, uint16_t r16, uint16_t g16,
+                           uint16_t b16);
   void initialize_buffer_internal(BitPlaneBuffer *buffers);  // Helper: initialize one buffer set
   void set_brightness_oe();
   void set_brightness_oe_internal(BitPlaneBuffer *buffers, uint8_t brightness);  // Helper: set OE for one buffer
@@ -175,6 +183,11 @@ class ParlioDma : public PlatformDma {
   uint8_t basis_brightness_;
   float intensity_;
   bool transfer_started_;
+
+  // ICN2053/FM6565 mode state
+  bool icn2053_mode_;
+  size_t icn2053_segment_count_;  // vsync segment + one working-layout row packet per scan line
+  uint16_t icn2053_chips_;        // driver chips per row, rounded up from pixels_per_row / 16
 
 #if HUB75_PPA_AVAILABLE
   ppa_client_handle_t ppa_srm_handle_;

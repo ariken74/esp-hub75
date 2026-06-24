@@ -45,6 +45,12 @@ static inline Hub75Config getMenuConfigSettings() {
   config.shift_driver = Hub75ShiftDriver::MBI5124;
 #elif defined(CONFIG_HUB75_DRIVER_DP3246)
   config.shift_driver = Hub75ShiftDriver::DP3246;
+#elif defined(CONFIG_HUB75_DRIVER_FM6353)
+  config.shift_driver = Hub75ShiftDriver::FM6353;
+#elif defined(CONFIG_HUB75_DRIVER_FM6363)
+  config.shift_driver = Hub75ShiftDriver::FM6363C;
+#elif defined(CONFIG_HUB75_DRIVER_FM6565C)
+  config.shift_driver = Hub75ShiftDriver::FM6565C;
 #endif
 
   // Pin configuration (board preset or custom)

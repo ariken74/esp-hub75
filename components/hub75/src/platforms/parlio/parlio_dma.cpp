@@ -38,25 +38,24 @@ static constexpr size_t kParlioChunkMaxWords = 4080;      // Max safe chunk (mus
 
 namespace hub75 {
 
-// HUB75 16-bit word layout for PARLIO peripheral
-// Bit layout: [CLK|ADDR(5-bit)|LAT|OE|--|--|R1|R2|G1|G2|B1|B2]
+// HUB75 16-bit word layout for PARLIO peripheral.
+// Match LAutour ICN2053 I2S bus order: R1,G1,B1,R2,G2,B2,LAT,OE,A,B,C,D,E.
 enum HUB75WordBits : uint16_t {
-  B2_BIT = 0,  // Lower half blue (data_pins[0])
-  B1_BIT = 1,  // Upper half blue (data_pins[1])
-  G2_BIT = 2,  // Lower half green (data_pins[2])
-  G1_BIT = 3,  // Upper half green (data_pins[3])
-  R2_BIT = 4,  // Lower half red (data_pins[4])
-  R1_BIT = 5,  // Upper half red (data_pins[5])
-  // Bits 6-7: Unused
-  OE_BIT = 8,
-  LAT_BIT = 9,
-  // Bits 10-14: Row address (5-bit field, shifted << 10)
+  R1_BIT = 0,
+  G1_BIT = 1,
+  B1_BIT = 2,
+  R2_BIT = 3,
+  G2_BIT = 4,
+  B2_BIT = 5,
+  LAT_BIT = 6,
+  OE_BIT = 7,
+  // Bits 8-12: Row address (5-bit field, shifted << 8)
   CLK_GATE_BIT =
       15,  // MSB: clock gate control (1=enabled, 0=disabled) - only on chips with SOC_PARLIO_TX_CLK_SUPPORT_GATING
 };
 
 // Address field (not individual bits)
-constexpr int ADDR_SHIFT = 10;
+constexpr int ADDR_SHIFT = 8;
 constexpr uint16_t ADDR_MASK = 0x1F;  // 5-bit address (0-31)
 
 // Combined RGB masks (used for clearing RGB bits in buffers)
@@ -119,7 +118,10 @@ ParlioDma::ParlioDma(const Hub75Config &config)
       tx_task_started_(false),
       basis_brightness_(config.brightness),
       intensity_(1.0f),
-      transfer_started_(false)
+      transfer_started_(false),
+      icn2053_mode_(config.shift_driver == Hub75ShiftDriver::FM6565C),
+      icn2053_segment_count_(0),
+      icn2053_chips_(0)
 #if HUB75_PPA_AVAILABLE
       ,
       ppa_srm_handle_(nullptr),
@@ -154,32 +156,50 @@ bool ParlioDma::init() {
            is_four_scan_wiring(scan_wiring_) ? "yes" : "no");
   ESP_LOGI(TAG, "Bit depth: %d", bit_depth_);
 
-  // Calculate BCM timings first
-  calculate_bcm_timings();
+  // ICN2053/FM6565 mode uses a different (PWM/internal-SRAM) buffer layout, not BCM.
+  if (icn2053_mode_) {
+    // No external blanking at idle; keep clock gated and OE low between chunks.
+    transmit_config_.idle_value = 0;
 
-  // Configure GPIO
-  configure_gpio();
+    configure_gpio();
+    configure_parlio();
+    if (!tx_unit_) {
+      ESP_LOGE(TAG, "Failed to create PARLIO TX unit");
+      return false;
+    }
+    ESP_LOGI(TAG, "PARLIO TX unit created, building ICN2053 frame buffer...");
+    if (!allocate_icn2053_buffers()) {
+      ESP_LOGE(TAG, "Failed to allocate ICN2053 buffers");
+      return false;
+    }
+  } else {
+    // Calculate BCM timings first
+    calculate_bcm_timings();
 
-  // Configure PARLIO peripheral
-  configure_parlio();
+    // Configure GPIO
+    configure_gpio();
 
-  if (!tx_unit_) {
-    ESP_LOGE(TAG, "Failed to create PARLIO TX unit");
-    return false;
+    // Configure PARLIO peripheral
+    configure_parlio();
+
+    if (!tx_unit_) {
+      ESP_LOGE(TAG, "Failed to create PARLIO TX unit");
+      return false;
+    }
+
+    ESP_LOGI(TAG, "PARLIO TX unit created, setting up DMA buffers...");
+
+    // Allocate row buffers with BCM padding
+    if (!allocate_row_buffers()) {
+      ESP_LOGE(TAG, "Failed to allocate row buffers");
+      return false;
+    }
+
+    // Initialize buffers with blank data
+    initialize_blank_buffers();
+    // Set OE bits for BCM control and brightness
+    set_brightness_oe();
   }
-
-  ESP_LOGI(TAG, "PARLIO TX unit created, setting up DMA buffers...");
-
-  // Allocate row buffers with BCM padding
-  if (!allocate_row_buffers()) {
-    ESP_LOGE(TAG, "Failed to allocate row buffers");
-    return false;
-  }
-
-  // Initialize buffers with blank data
-  initialize_blank_buffers();
-  // Set OE bits for BCM control and brightness
-  set_brightness_oe();
 
   // Enable unit BEFORE queuing transactions (required by PARLIO API!)
   ESP_LOGI(TAG, "Enabling PARLIO TX unit...");
@@ -287,14 +307,20 @@ void ParlioDma::configure_parlio() {
   // Calculate TOTAL buffer size (all rows × all bits) for single-buffer transmission
   // Buffer structure: [pixels (LAT on last pixel)][padding]
   size_t max_buffer_size = 0;
-  for (int row = 0; row < num_rows_; row++) {
-    for (int bit = 0; bit < bit_depth_; bit++) {
-      max_buffer_size += dma_width_ + calculate_bcm_padding(bit);
+  if (icn2053_mode_) {
+    // ICN2053 streams in chunks of at most kParlioChunkMaxWords; the single-transmit
+    // limit only needs to cover one chunk.
+    max_buffer_size = kParlioChunkMaxWords;
+  } else {
+    for (int row = 0; row < num_rows_; row++) {
+      for (int bit = 0; bit < bit_depth_; bit++) {
+        max_buffer_size += dma_width_ + calculate_bcm_padding(bit);
+      }
     }
   }
 
   // Configure PARLIO TX unit
-  // Pin layout: [CLK_GATE(15)|ADDR(14-10)|LAT(9)|OE(8)|--|--|R2(4)|R1(5)|G2(2)|G1(3)|B2(0)|B1(1)]
+  // Pin layout: [CLK_GATE(15)|--|--|ADDR(12-8)|OE(7)|LAT(6)|B2(5)|G2(4)|R2(3)|B1(2)|G1(1)|R1(0)]
   parlio_tx_unit_config_t config = {
       .clk_src = PARLIO_CLK_SRC_DEFAULT,
       .clk_in_gpio_num = GPIO_NUM_NC,  // Use internal clock
@@ -303,21 +329,21 @@ void ParlioDma::configure_parlio() {
       .data_width = 16,  // Full 16-bit width
       .data_gpio_nums =
           {
-              (gpio_num_t) config_.pins.b2,   // 0: B2 (lower half blue)
-              (gpio_num_t) config_.pins.b1,   // 1: B1 (upper half blue)
-              (gpio_num_t) config_.pins.g2,   // 2: G2 (lower half green)
-              (gpio_num_t) config_.pins.g1,   // 3: G1 (upper half green)
-              (gpio_num_t) config_.pins.r2,   // 4: R2 (lower half red)
-              (gpio_num_t) config_.pins.r1,   // 5: R1 (upper half red)
-              GPIO_NUM_NC,                    // 6: Unused
-              GPIO_NUM_NC,                    // 7: Unused
-              (gpio_num_t) config_.pins.oe,   // 8: OE (output enable)
-              (gpio_num_t) config_.pins.lat,  // 9: LAT (latch)
-              (gpio_num_t) config_.pins.a,    // 10: ADDR_A
-              (gpio_num_t) config_.pins.b,    // 11: ADDR_B
-              (gpio_num_t) config_.pins.c,    // 12: ADDR_C
-              (gpio_num_t) config_.pins.d,    // 13: ADDR_D
-              (gpio_num_t) config_.pins.e,    // 14: ADDR_E (5th address bit for 64px tall panels)
+              (gpio_num_t) config_.pins.r1,   // 0: R1
+              (gpio_num_t) config_.pins.g1,   // 1: G1
+              (gpio_num_t) config_.pins.b1,   // 2: B1
+              (gpio_num_t) config_.pins.r2,   // 3: R2
+              (gpio_num_t) config_.pins.g2,   // 4: G2
+              (gpio_num_t) config_.pins.b2,   // 5: B2
+              (gpio_num_t) config_.pins.lat,  // 6: LAT
+              (gpio_num_t) config_.pins.oe,   // 7: OE/GCLK
+              (gpio_num_t) config_.pins.a,    // 8: ADDR_A
+              (gpio_num_t) config_.pins.b,    // 9: ADDR_B
+              (gpio_num_t) config_.pins.c,    // 10: ADDR_C
+              (gpio_num_t) config_.pins.d,    // 11: ADDR_D
+              (gpio_num_t) config_.pins.e,    // 12: ADDR_E
+              GPIO_NUM_NC,                    // 13: Unused
+              GPIO_NUM_NC,                    // 14: Unused
               GPIO_NUM_NC                     // 15: CLK_GATE (MSB, data-controlled)
           },
       .clk_out_gpio_num = (gpio_num_t) config_.pins.clk,
@@ -595,6 +621,300 @@ bool ParlioDma::allocate_row_buffers() {
   return true;
 }
 
+// ============================================================================
+// ICN2053 / FM6565 mode (PWM internal-SRAM driver family)
+// ============================================================================
+//
+// Frame layout streamed through the same chunk engine, organised as segments so
+// chunks never split a row packet:
+//   segment 0            : VSYNC / enable prefix
+//   segment 1..scan_lines: working-library row packet:
+//       16 * (pixels_per_row + 8) + 8 words, overlaid on the continuous
+//       ICN2053 row-address/OE suffix stream.
+//
+// DCLK is the PARLIO output clock. ICN2053-family chips use OE as GCLK, so OE
+// pulses are data words in the stream, not HUB75 blanking intervals.
+
+static constexpr size_t kIcn2053Outputs = 16;
+static constexpr size_t kIcn2053GclkPulses = 138;
+static constexpr size_t kIcn2053GclkWords = kIcn2053GclkPulses * 2;
+static constexpr size_t kIcn2053RowOeAddWords = 2;
+static constexpr size_t kIcn2053RowOeWords = kIcn2053GclkWords + kIcn2053RowOeAddWords;
+static constexpr size_t kIcn2053SubrowAddWords = 8;
+static constexpr size_t kIcn2053RowAddWords = 8;
+static constexpr size_t kIcn2053FrameAddWords = 16;
+static constexpr size_t kIcn2053CmdDelayWords = 16;
+static constexpr uint16_t kIcn2053RegDebug = 0x0008;
+static constexpr uint16_t kIcn2053RegCfg1Base = 0x0070;
+static constexpr uint16_t kIcn2053RegCfg2 = 0x7ddb;
+static constexpr uint16_t kIcn2053RegCfg3 = 0x4047;
+static constexpr uint16_t kIcn2053RegCfg4 = 0x0e40;
+
+static inline uint16_t *icn2053_word(uint16_t *buffer, size_t offset) { return &buffer[offset]; }
+
+static uint16_t icn2053_rgb_mask(uint16_t r16, uint16_t g16, uint16_t b16, uint8_t pwm_bit, bool lower) {
+  const uint16_t r_bit = (r16 >> pwm_bit) & 1;
+  const uint16_t g_bit = (g16 >> pwm_bit) & 1;
+  const uint16_t b_bit = (b16 >> pwm_bit) & 1;
+
+  if (lower) {
+    return static_cast<uint16_t>((r_bit << R2_BIT) | (g_bit << G2_BIT) | (b_bit << B2_BIT));
+  }
+  return static_cast<uint16_t>((r_bit << R1_BIT) | (g_bit << G1_BIT) | (b_bit << B1_BIT));
+}
+
+static size_t icn2053_lat(uint16_t *buffer, size_t offset, size_t len) {
+  while (len-- > 0) {
+    *icn2053_word(buffer, offset++) |= static_cast<uint16_t>(1 << LAT_BIT);
+  }
+  return offset;
+}
+
+static size_t icn2053_skip(size_t offset, size_t len) { return offset + len; }
+
+static size_t icn2053_build_vsync(uint16_t *buffer, size_t offset, bool leds_enable, bool vsync) {
+  constexpr size_t kPreAct = 14;
+  constexpr size_t kEnOp = 12;
+  constexpr size_t kDisOp = 13;
+  constexpr size_t kVsync = 3;
+
+  offset = icn2053_skip(offset, kIcn2053CmdDelayWords);
+  offset = icn2053_lat(buffer, offset, kPreAct);
+  offset = icn2053_skip(offset, kIcn2053CmdDelayWords);
+  if (leds_enable) {
+    offset = icn2053_lat(buffer, offset, kEnOp);
+    offset = icn2053_skip(offset, kIcn2053CmdDelayWords + kDisOp - kEnOp);
+  } else {
+    offset = icn2053_lat(buffer, offset, kDisOp);
+    offset = icn2053_skip(offset, kIcn2053CmdDelayWords);
+  }
+  if (vsync) {
+    offset = icn2053_lat(buffer, offset, kVsync);
+  } else {
+    offset = icn2053_skip(offset, kVsync);
+  }
+  offset = icn2053_skip(offset, kIcn2053CmdDelayWords);
+  offset = icn2053_lat(buffer, offset, kPreAct);
+  offset = icn2053_skip(offset, kIcn2053CmdDelayWords);
+  return offset;
+}
+
+static size_t icn2053_write_reg_payload(uint16_t *buffer, size_t offset, uint16_t value, uint16_t chips) {
+  for (uint16_t chip = 0; chip < chips; chip++) {
+    for (uint8_t bit = 0; bit < 16; bit++) {
+      uint16_t word = *icn2053_word(buffer, offset) & RGB_CLEAR_MASK;
+      if ((value << bit) & 0x8000) {
+        word |= RGB_MASK;
+      }
+      *icn2053_word(buffer, offset++) = word;
+    }
+  }
+  return offset;
+}
+
+static size_t icn2053_build_reg_prefix(uint16_t *buffer, size_t offset, uint16_t value, uint8_t command,
+                                       uint16_t chips) {
+  offset = icn2053_skip(offset, kIcn2053FrameAddWords);
+  offset = icn2053_build_vsync(buffer, offset, true, true);
+  offset = icn2053_write_reg_payload(buffer, offset, value, chips);
+
+  const size_t command_start = offset - command;
+  for (size_t i = offset - 16; i < offset; i++) {
+    *icn2053_word(buffer, i) &= static_cast<uint16_t>(~(1 << LAT_BIT));
+  }
+  for (size_t i = command_start; i < offset; i++) {
+    *icn2053_word(buffer, i) |= static_cast<uint16_t>(1 << LAT_BIT);
+  }
+
+  return offset;
+}
+
+static size_t icn2053_fill_oe_addr(uint16_t *buffer, size_t offset, size_t limit, uint16_t row_count,
+                                   size_t frame_offset, uint16_t clk) {
+  if (row_count == 0) {
+    return frame_offset;
+  }
+
+  const size_t frame_words = kIcn2053RowOeWords * row_count;
+  if (frame_offset >= frame_words) {
+    frame_offset = 0;
+  }
+
+  uint16_t addr = static_cast<uint16_t>(frame_offset / kIcn2053RowOeWords);
+  size_t row_offset = frame_offset % kIcn2053RowOeWords;
+  size_t oe_count = (row_offset > kIcn2053GclkWords) ? 0 : (kIcn2053GclkPulses - (row_offset >> 1));
+
+  while (offset < limit) {
+    if (row_offset == kIcn2053RowOeWords) {
+      addr++;
+      if (addr >= row_count) {
+        addr = 0;
+        frame_offset = 0;
+      }
+      row_offset = 0;
+      oe_count = kIcn2053GclkPulses;
+    }
+
+    const uint16_t addr_field = static_cast<uint16_t>((addr & ADDR_MASK) << ADDR_SHIFT);
+    if (oe_count > 0) {
+      *icn2053_word(buffer, offset++) = static_cast<uint16_t>(clk | addr_field | (1 << OE_BIT));
+      oe_count--;
+    } else {
+      *icn2053_word(buffer, offset++) = static_cast<uint16_t>(clk | addr_field);
+    }
+    row_offset++;
+    frame_offset++;
+
+    if (offset >= limit) {
+      break;
+    }
+    *icn2053_word(buffer, offset++) = static_cast<uint16_t>(clk | addr_field);
+    row_offset++;
+    frame_offset++;
+  }
+
+  return frame_offset;
+}
+
+void ParlioDma::build_icn2053_frame(BitPlaneBuffer *buffers, bool full_white) {
+  const uint16_t scan_lines = num_rows_;
+  const uint16_t clk = static_cast<uint16_t>(1 << CLK_GATE_BIT);  // DCLK enabled
+
+  std::fill(buffers[0].data, buffers[0].data + buffers[0].total_words, clk);
+  const uint16_t cfg1 = static_cast<uint16_t>(((scan_lines - 1) << 8) | (kIcn2053RegCfg1Base & 0x00ff));
+  const struct {
+    uint16_t value;
+    uint8_t command;
+  } regs[] = {
+      {cfg1, 4},
+      {kIcn2053RegCfg2, 6},
+      {kIcn2053RegCfg3, 8},
+      {kIcn2053RegCfg4, 10},
+      {kIcn2053RegDebug, 2},
+  };
+
+  size_t prefix_offset = 0;
+  for (const auto &reg : regs) {
+    prefix_offset = icn2053_build_reg_prefix(buffers[0].data, prefix_offset, reg.value, reg.command, icn2053_chips_);
+  }
+  icn2053_build_vsync(buffers[0].data, prefix_offset + kIcn2053FrameAddWords, true, true);
+
+  const uint16_t data_rgb = full_white ? RGB_MASK : 0;
+  const size_t subrow_words = static_cast<size_t>(dma_width_) + kIcn2053SubrowAddWords;
+  size_t frame_offset = 0;
+
+  for (uint16_t row = 0; row < scan_lines; row++) {
+    BitPlaneBuffer &bp = buffers[1 + row];
+    frame_offset = icn2053_fill_oe_addr(bp.data, 0, bp.total_words, scan_lines, frame_offset, clk);
+
+    for (size_t subrow = 0; subrow < kIcn2053Outputs; subrow++) {
+      *icn2053_word(bp.data, (subrow * subrow_words) + dma_width_ - 1) |= static_cast<uint16_t>(1 << LAT_BIT);
+    }
+
+    if (data_rgb != 0) {
+      for (size_t subrow = 0; subrow < kIcn2053Outputs; subrow++) {
+        uint16_t *data = bp.data + (subrow * subrow_words);
+        for (size_t x = 0; x < dma_width_; x++) {
+          uint16_t *word = icn2053_word(data, x);
+          *word = static_cast<uint16_t>((*word & RGB_CLEAR_MASK) | data_rgb);
+        }
+      }
+    }
+  }
+}
+
+uint16_t ParlioDma::scale_icn2053_color(uint8_t value) const {
+  uint32_t corrected = lut_ ? lut_[value] : value;
+  corrected = (corrected * basis_brightness_) / 255;
+  corrected = static_cast<uint32_t>(corrected * intensity_);
+
+  if (bit_depth_ >= 16) {
+    return static_cast<uint16_t>(std::min<uint32_t>(corrected, 0xffff));
+  }
+
+  const uint32_t max_value = (1u << bit_depth_) - 1u;
+  corrected = std::min(corrected, max_value);
+  return static_cast<uint16_t>((corrected * 0xffffu + (max_value / 2u)) / max_value);
+}
+
+void ParlioDma::write_icn2053_pixel(uint16_t phys_x, uint16_t phys_row, bool is_lower, uint16_t r16, uint16_t g16,
+                                    uint16_t b16) {
+  if (!row_buffers_[0] || phys_x >= dma_width_ || phys_row >= num_rows_) {
+    return;
+  }
+
+  const size_t chain_pos = static_cast<size_t>(dma_width_ - 1 - phys_x);
+  const size_t chip = chain_pos / 16;
+  const size_t subrow = chain_pos % 16;
+  const size_t subrow_words = static_cast<size_t>(dma_width_) + kIcn2053SubrowAddWords;
+  const size_t base = subrow * subrow_words + chip * 16;
+  BitPlaneBuffer &bp = row_buffers_[0][1 + phys_row];
+
+  for (uint8_t pwm_word = 0; pwm_word < 16; pwm_word++) {
+    const size_t word_index = base + pwm_word;
+    if (word_index >= bp.total_words) {
+      continue;
+    }
+
+    const uint8_t pwm_bit = 15 - pwm_word;
+    const uint16_t clear_mask = is_lower ? static_cast<uint16_t>(~RGB_LOWER_MASK)
+                                         : static_cast<uint16_t>(~RGB_UPPER_MASK);
+    uint16_t *word = icn2053_word(bp.data, word_index);
+    *word = static_cast<uint16_t>((*word & clear_mask) | icn2053_rgb_mask(r16, g16, b16, pwm_bit, is_lower));
+  }
+}
+
+bool ParlioDma::allocate_icn2053_buffers() {
+  const uint16_t scan_lines = num_rows_;
+  const uint16_t pixels_per_row = dma_width_;
+  icn2053_chips_ = std::max<uint16_t>(1, (pixels_per_row + 15) / 16);
+  icn2053_segment_count_ = 1 + static_cast<size_t>(scan_lines);
+
+  const size_t row_words =
+      kIcn2053Outputs * (static_cast<size_t>(pixels_per_row) + kIcn2053SubrowAddWords) + kIcn2053RowAddWords;
+  const size_t single_prefix_words = kIcn2053FrameAddWords + 128 + static_cast<size_t>(pixels_per_row);
+  const size_t vsync_words = single_prefix_words * 6;
+
+  const size_t total_words = vsync_words + static_cast<size_t>(scan_lines) * row_words;
+  total_buffer_bytes_ = total_words * sizeof(uint16_t);
+
+  ESP_LOGI(TAG, "ICN2053 buffer: %u scan lines, %u chips/row, %zu words/line, %zu words total (%zu KB)", scan_lines,
+           icn2053_chips_, row_words, total_words, total_buffer_bytes_ / 1024);
+
+  row_buffers_[0] = new BitPlaneBuffer[icn2053_segment_count_];
+
+#ifdef CONFIG_IDF_TARGET_ESP32C6
+  dma_buffers_[0] = (uint16_t *) heap_caps_calloc(total_words, sizeof(uint16_t), MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+#else
+  dma_buffers_[0] = (uint16_t *) heap_caps_aligned_calloc(32, total_words, sizeof(uint16_t),
+                                                          MALLOC_CAP_DMA | MALLOC_CAP_SPIRAM);
+#endif
+  if (!dma_buffers_[0]) {
+    ESP_LOGE(TAG, "Failed to allocate %zu bytes for ICN2053 buffer", total_buffer_bytes_);
+    delete[] row_buffers_[0];
+    row_buffers_[0] = nullptr;
+    return false;
+  }
+
+  uint16_t *ptr = dma_buffers_[0];
+  row_buffers_[0][0] = {ptr, vsync_words, 0, vsync_words};
+  ptr += vsync_words;
+  for (uint16_t y = 0; y < scan_lines; y++) {
+    row_buffers_[0][1 + y] = {ptr, row_words, 0, row_words};
+    ptr += row_words;
+  }
+
+  front_idx_ = 0;
+  active_idx_ = 0;
+  is_double_buffered_ = false;
+
+  build_icn2053_frame(row_buffers_[0], /*full_white=*/true);
+  flush_cache_to_dma();
+
+  ESP_LOGI(TAG, "ICN2053 frame buffer built");
+  return true;
+}
+
 void ParlioDma::start_transfer() {
   if (!tx_unit_ || transfer_started_) {
     return;
@@ -824,6 +1144,10 @@ void ParlioDma::set_brightness_oe_internal(BitPlaneBuffer *buffers, uint8_t brig
 }
 
 void ParlioDma::set_brightness_oe() {
+  if (icn2053_mode_) {
+    return;
+  }
+
   if (!row_buffers_[0]) {
     ESP_LOGE(TAG, "Row buffers not allocated");
     return;
@@ -881,7 +1205,8 @@ bool ParlioDma::build_transaction_queue() {
     return false;
   }
   chunk_count_ = (total_buffer_words_ + chunk_words_ - 1) / chunk_words_;
-  segment_count_ = static_cast<size_t>(num_rows_) * static_cast<size_t>(bit_depth_);
+  segment_count_ = icn2053_mode_ ? icn2053_segment_count_
+                                 : static_cast<size_t>(num_rows_) * static_cast<size_t>(bit_depth_);
   segment_index_ = 0;
   segment_offset_words_ = 0;
   chunks_per_frame_ = 0;
@@ -943,6 +1268,10 @@ void ParlioDma::set_basis_brightness(uint8_t brightness) {
       ESP_LOGD(TAG, "Basis brightness set to %u", (unsigned) brightness);
     }
 
+    if (icn2053_mode_) {
+      return;
+    }
+
     set_brightness_oe();
   }
 }
@@ -952,6 +1281,9 @@ void ParlioDma::set_intensity(float intensity) {
   if (intensity != intensity_) {
     intensity_ = intensity;
     ESP_LOGD(TAG, "Intensity set to %.2f", intensity);
+    if (icn2053_mode_) {
+      return;
+    }
     set_brightness_oe();
   }
 }
@@ -960,6 +1292,48 @@ void ParlioDma::set_rotation(Hub75Rotation rotation) { rotation_ = rotation; }
 
 HUB75_IRAM void ParlioDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint16_t h, const uint8_t *buffer,
                                        Hub75PixelFormat format, Hub75ColorOrder color_order, bool big_endian) {
+  if (icn2053_mode_) {
+    if (!row_buffers_[0] || !buffer) [[unlikely]] {
+      return;
+    }
+
+    const uint16_t rotated_width = RotationTransform::get_rotated_width(virtual_width_, virtual_height_, rotation_);
+    const uint16_t rotated_height = RotationTransform::get_rotated_height(virtual_width_, virtual_height_, rotation_);
+    if (x >= rotated_width || y >= rotated_height) [[unlikely]] {
+      return;
+    }
+    if (x + w > rotated_width) [[unlikely]] {
+      w = rotated_width - x;
+    }
+    if (y + h > rotated_height) [[unlikely]] {
+      h = rotated_height - y;
+    }
+
+    const size_t pixel_stride = (format == Hub75PixelFormat::RGB888)   ? 3
+                                : (format == Hub75PixelFormat::RGB565) ? 2
+                                                                       : 4;
+    const uint8_t *pixel_ptr = buffer;
+    for (uint16_t dy = 0; dy < h; dy++) {
+      for (uint16_t dx = 0; dx < w; dx++) {
+        uint16_t px = x + dx;
+        uint16_t py = y + dy;
+        auto transformed = transform_coordinate(px, py, rotation_, needs_layout_remap_, needs_scan_remap_, layout_,
+                                                scan_wiring_, panel_width_, panel_height_, layout_rows_, layout_cols_,
+                                                virtual_width_, virtual_height_, dma_width_, num_rows_);
+
+        uint8_t r8 = 0, g8 = 0, b8 = 0;
+        extract_rgb888_from_format(pixel_ptr, 0, format, color_order, big_endian, r8, g8, b8);
+        pixel_ptr += pixel_stride;
+
+        write_icn2053_pixel(transformed.x, transformed.row, transformed.is_lower, scale_icn2053_color(r8),
+                            scale_icn2053_color(g8), scale_icn2053_color(b8));
+      }
+    }
+
+    flush_cache_to_dma();
+    return;
+  }
+
   // Always write to active buffer (CPU drawing buffer)
   BitPlaneBuffer *target_buffers = row_buffers_[active_idx_];
 
@@ -1062,7 +1436,7 @@ HUB75_IRAM void ParlioDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint1
       const int row_base_idx = row * bit_depth_;
 
       // Branchless bit-plane update using shift+and
-      // PARLIO bit layout: [CLK_GATE(15)|ADDR(14-11)|--|LAT(9)|OE(8)|--|--|R2(4)|R1(5)|G2(2)|G1(3)|B2(0)|B1(1)]
+      // PARLIO bit layout matches LAutour ICN2053 I2S bus order.
       for (int bit = 0; bit < bit_depth_; bit++) {
         BitPlaneBuffer &bp = target_buffers[row_base_idx + bit];
 
@@ -1090,6 +1464,14 @@ HUB75_IRAM void ParlioDma::draw_pixels(uint16_t x, uint16_t y, uint16_t w, uint1
 }
 
 void ParlioDma::clear() {
+  if (icn2053_mode_) {
+    if (!row_buffers_[0]) {
+      return;
+    }
+    build_icn2053_frame(row_buffers_[0], /*full_white=*/false);
+    flush_cache_to_dma();
+    return;
+  }
   // Always write to active buffer (CPU drawing buffer)
   BitPlaneBuffer *target_buffers = row_buffers_[active_idx_];
 
@@ -1119,6 +1501,41 @@ void ParlioDma::clear() {
 }
 
 HUB75_IRAM void ParlioDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint8_t r, uint8_t g, uint8_t b) {
+  if (icn2053_mode_) {
+    if (!row_buffers_[0]) [[unlikely]] {
+      return;
+    }
+
+    const uint16_t rotated_width = RotationTransform::get_rotated_width(virtual_width_, virtual_height_, rotation_);
+    const uint16_t rotated_height = RotationTransform::get_rotated_height(virtual_width_, virtual_height_, rotation_);
+    if (x >= rotated_width || y >= rotated_height) [[unlikely]] {
+      return;
+    }
+    if (x + w > rotated_width) [[unlikely]] {
+      w = rotated_width - x;
+    }
+    if (y + h > rotated_height) [[unlikely]] {
+      h = rotated_height - y;
+    }
+
+    const uint16_t r16 = scale_icn2053_color(r);
+    const uint16_t g16 = scale_icn2053_color(g);
+    const uint16_t b16 = scale_icn2053_color(b);
+
+    for (uint16_t dy = 0; dy < h; dy++) {
+      for (uint16_t dx = 0; dx < w; dx++) {
+        uint16_t px = x + dx;
+        uint16_t py = y + dy;
+        auto transformed = transform_coordinate(px, py, rotation_, needs_layout_remap_, needs_scan_remap_, layout_,
+                                                scan_wiring_, panel_width_, panel_height_, layout_rows_, layout_cols_,
+                                                virtual_width_, virtual_height_, dma_width_, num_rows_);
+        write_icn2053_pixel(transformed.x, transformed.row, transformed.is_lower, r16, g16, b16);
+      }
+    }
+
+    flush_cache_to_dma();
+    return;
+  }
   // Always write to active buffer (CPU drawing buffer)
   BitPlaneBuffer *target_buffers = row_buffers_[active_idx_];
 
@@ -1149,7 +1566,7 @@ HUB75_IRAM void ParlioDma::fill(uint16_t x, uint16_t y, uint16_t w, uint16_t h, 
   const uint16_t b_corrected = lut_[b];
 
   // Pre-compute bit patterns for all bit planes (ONCE for entire fill)
-  // PARLIO bit layout: R1=5, R2=4, G1=3, G2=2, B1=1, B2=0
+  // PARLIO bit layout matches LAutour ICN2053 I2S bus order.
   uint16_t upper_patterns[HUB75_BIT_DEPTH];
   uint16_t lower_patterns[HUB75_BIT_DEPTH];
   for (int bit = 0; bit < bit_depth_; bit++) {

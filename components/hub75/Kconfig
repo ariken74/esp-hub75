@@ -203,6 +203,29 @@ menu "HUB75 RGB LED Matrix Driver"
 
             config HUB75_DRIVER_DP3246
                 bool "DP3246"
+
+            config HUB75_DRIVER_FM6353
+                bool "FM6353 S-PWM (Experimental)"
+                help
+                    Experimental support for FM6353 S-PWM driver chips.
+                    These panels use GCLK/grayscale timing that differs from
+                    normal HUB75 PWM timing.
+
+            config HUB75_DRIVER_FM6363
+                bool "FM6363/FM6363C S-PWM (Experimental)"
+                help
+                    Experimental support for FM6363/FM6363C S-PWM driver chips.
+                    FM6363-class panels need GCLK packet timing and continuous
+                    clock handling during refresh, so normal HUB75 DMA refresh
+                    may not be sufficient on every panel.
+
+            config HUB75_DRIVER_FM6565C
+                bool "FM6565C/FM6565QB S-PWM Diagnostic"
+                help
+                    Diagnostic support for FM6565C/FM6565QB S-PWM driver chips.
+                    Public datasheets do not document the full register protocol,
+                    so this currently uses an FM6363-compatible register set and
+                    bypasses normal DMA refresh with a solid-frame GCLK test.
         endchoice
 
         choice HUB75_BIT_DEPTH_CHOICE

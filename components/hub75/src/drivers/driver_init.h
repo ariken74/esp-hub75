@@ -20,9 +20,12 @@ class DriverInit {
   // @param config Panel configuration
   // @return ESP_OK on success
   static esp_err_t initialize(const Hub75Config &config);
+  static bool start_fm63xx_white_diagnostic(const Hub75Config &config);
 
  private:
   static void fm6126a_init(const Hub75Pins &pins, uint16_t pixels_per_row);
+  static void fm63xx_spwm_init(const Hub75Config &config, const char *driver_name,
+                                const uint16_t (&base_config)[5]);
   static void dp3246_init(const Hub75Pins &pins, uint16_t pixels_per_row);
 };
 

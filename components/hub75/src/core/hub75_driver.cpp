@@ -87,6 +87,14 @@ bool Hub75Driver::begin() {
     return false;
   }
 
+  // FM63xx/ICN2053-family diagnostic bypass: verify register init, OE/GCLK,
+  // address pins, and RGB data before bringing PARLIO back into the loop.
+  if (config_.shift_driver == Hub75ShiftDriver::FM6363 || config_.shift_driver == Hub75ShiftDriver::FM6565C) {
+    ESP_LOGW(TAG, "FM63xx diagnostic mode: bypassing normal HUB75 DMA refresh");
+    running_ = DriverInit::start_fm63xx_white_diagnostic(config_);
+    return running_;
+  }
+
   // Create platform-specific DMA implementation
   dma_ = new PlatformDMAImpl(config_);
   if (!dma_ || !dma_->init()) {
